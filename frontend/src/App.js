@@ -1187,10 +1187,14 @@ if (!loggedIn) {
             <div className="hero-main">
               <div className="brand-title-row">
                 <img src={dosewiseLogo} alt="DoseWise logo" className="brand-logo" />
-                <h1 className="app-title app-title-compact app-title-single-line mb-0">Medication Dashboard</h1>
+                  <h1 className="app-title app-title-compact app-title-single-line mb-0">
+                    {currentView === "profile" ? "User Profile" : "Medication Dashboard"}
+                  </h1>
               </div>
               <p className="hero-copy">
-                Track medications, review label highlights, and stay on top of safety details.
+                {currentView === "profile"
+                  ? "Manage your health profile, allergies, conditions, and favorite pharmacy."
+                  : "Track medications, review label highlights, and stay on top of safety details."}
               </p>
             </div>
 
