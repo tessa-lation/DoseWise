@@ -1,4 +1,5 @@
 import re
+import requests
 
 from flask import Flask, jsonify, request, session
 import jwt
@@ -23,6 +24,8 @@ ENV = os.environ.get("APP_ENV", "production")
 
 JWT_SECRET = os.environ.get("JWT_SECRET") or app.config["SECRET_KEY"]
 
+
+
 if not isinstance(JWT_SECRET, str) or not JWT_SECRET:
     JWT_SECRET = "dev-only"
 
@@ -38,10 +41,15 @@ COMPARE_API_BASE = os.environ.get(
     "http://localhost:5001/api" if IS_LOCAL else "https://compare-api.up.railway.app/api"
 )
 
+FHIR_SERVER_URL = os.environ.get(
+    "FHIR_SERVER_URL",
+    "https://hapi.fhir.org/baseR4"
+).rstrip("/")
+
 google_places_api_key = os.environ.get("GOOGLE_PLACES_API_KEY")
 
-print("GOOGLE KEY PREFIX:", (os.environ.get("GOOGLE_PLACES_API_KEY") or "")[:10])
-print("GOOGLE KEY PRESENT:", bool(os.environ.get("GOOGLE_PLACES_API_KEY")))
+# print("GOOGLE KEY PREFIX:", (os.environ.get("GOOGLE_PLACES_API_KEY") or "")[:10])
+# print("GOOGLE KEY PRESENT:", bool(os.environ.get("GOOGLE_PLACES_API_KEY")))
 
 
 CORS(app, supports_credentials=True, origins=[FRONTEND_ORIGIN])
@@ -623,6 +631,35 @@ def add_medication():
 
         conn.commit()
 
+        try:
+            user = conn.execute(
+                "SELECT id, name, email FROM users WHERE id = ?",
+                (user_id,)
+            ).fetchone()
+
+            hapi_patient = post_fhir_patient_to_hapi(dict(user))
+            hapi_patient_id = hapi_patient.get("id")
+
+            hapi_medication_request = post_fhir_medication_request_to_hapi(
+                user_id,
+                {
+                    "name": name,
+                    "rxcui": rxcui
+                },
+                hapi_patient_id=hapi_patient_id
+            )
+
+            hapi_medication_request_id = hapi_medication_request.get("id")
+
+            print("HAPI Patient created:", f"{FHIR_SERVER_URL}/Patient/{hapi_patient_id}")
+            print("HAPI MedicationRequest created:",
+                  f"{FHIR_SERVER_URL}/MedicationRequest/{hapi_medication_request_id}")
+
+        except Exception as e:
+            print("Failed to create HAPI MedicationRequest:", e)
+            hapi_medication_request = None
+            hapi_medication_request_id = None
+
         refresh_user_medication_conflicts(user_id)
         return jsonify({
             "message": "Medication saved successfully",
@@ -638,7 +675,12 @@ def add_medication():
                 "notes": notes
             },
             "interactionCheck": interaction_check,
-            "allergyWarnings": combined_allergy_warnings
+            "allergyWarnings": combined_allergy_warnings,
+            "fhirMedicationRequestUrl": (
+                f"{FHIR_SERVER_URL}/MedicationRequest/{hapi_medication_request_id}"
+                if hapi_medication_request_id
+                else None
+            )
         }), 201
 
     except sqlite3.IntegrityError:
@@ -648,49 +690,107 @@ def add_medication():
 
     finally:
         conn.close()
-        
-def build_fhir_medication_request(med):
-    return {
-        "resourceType": "MedicationRequest",
-        "id": str(med["id"]),
-        "meta": {
-            "profile": ["http://hl7.org/fhir/StructureDefinition/MedicationRequest"]
+
+
+def post_fhir_medication_request_to_hapi(user_id, medication, hapi_patient_id=None):
+    fhir_med_request = build_fhir_medication_request(
+        user_id,
+        medication,
+        hapi_patient_id=hapi_patient_id
+    )
+
+    response = requests.post(
+        f"{FHIR_SERVER_URL}/MedicationRequest",
+        json=fhir_med_request,
+        headers={
+            "Content-Type": "application/fhir+json",
+            "Accept": "application/fhir+json"
         },
-        "status": "active",
-        "intent": "order",
-        "medicationCodeableConcept": {
-            "coding": [
-                {
-                    "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
-                    "code": med["rxcui"],
-                    "display": med["name"]
-                }
-            ],
-            "text": med["name"]
-        },
-        "subject": {
-            "reference": f"Patient/{med['user_id']}"
-        },
-        "dosageInstruction": [
+        timeout=10
+    )
+
+    if not response.ok:
+        print("HAPI MedicationRequest status:", response.status_code)
+        print("HAPI MedicationRequest response:", response.text)
+        print("FHIR sent:", fhir_med_request)
+
+    response.raise_for_status()
+    return response.json()
+
+def post_fhir_patient_to_hapi(user):
+    patient = {
+        "resourceType": "Patient",
+        "name": [
             {
-                "text": med["dosage"] or "No dosage specified"
+                "text": user.get("name", "DoseWise User")
             }
         ],
-        "note": [
+        "telecom": [
             {
-                "text": med["notes"] or ""
+                "system": "email",
+                "value": user.get("email", "")
             }
         ]
     }
 
-def build_fhir_medication_bundle(medications):
+    response = requests.post(
+        f"{FHIR_SERVER_URL}/Patient",
+        json=patient,
+        headers={
+            "Content-Type": "application/fhir+json",
+            "Accept": "application/fhir+json"
+        },
+        timeout=10
+    )
+
+    if not response.ok:
+        print("HAPI Patient status:", response.status_code)
+        print("HAPI Patient response:", response.text)
+
+    response.raise_for_status()
+    return response.json()
+
+def build_fhir_medication_request(user_id, medication, hapi_patient_id=None):
+    medication_name = (
+        medication.get("name")
+        or medication.get("medication_name")
+        or medication.get("display_name")
+        or medication.get("drug_name")
+        or "Unknown medication"
+    )
+
+    rxcui = medication.get("rxcui")
+
+    medication_codeable_concept = {
+        "text": medication_name
+    }
+
+    if rxcui:
+        medication_codeable_concept["coding"] = [
+            {
+                "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+                "code": str(rxcui),
+                "display": medication_name
+            }
+        ]
+
+    return {
+        "resourceType": "MedicationRequest",
+        "status": "active",
+        "intent": "order",
+        "subject": {
+            "reference": f"Patient/{hapi_patient_id or user_id}"
+        },
+        "medicationCodeableConcept": medication_codeable_concept
+    }
+
+def build_fhir_medication_bundle(user_id, medications):
     return {
         "resourceType": "Bundle",
         "type": "collection",
         "entry": [
             {
-                "fullUrl": f"MedicationRequest/{med['id']}",
-                "resource": build_fhir_medication_request(med)
+                "resource": build_fhir_medication_request(user_id, dict(med))
             }
             for med in medications
         ]
@@ -722,7 +822,6 @@ def build_fhir_patient(user, profile=None):
 
 
 def build_fhir_allergy_intolerance(user_id, allergy):
-
     return {
         "resourceType": "AllergyIntolerance",
         "id": f"{user_id}-allergy",
@@ -743,14 +842,140 @@ def build_fhir_allergy_intolerance(user_id, allergy):
         },
         "code": {
             "text": allergy["fhir_text"]
-        },
-        "clinicalStatus": {
-            "text": "active"
-        },
+        }
     }
 
+def build_fhir_patient(user, profile):
+    patient = {
+        "resourceType": "Patient",
+        "active": True,
+        "name": [
+            {
+                "use": "official",
+                "text": user["name"]
+            }
+        ],
+        "telecom": [
+            {
+                "system": "email",
+                "value": user["email"],
+                "use": "home"
+            }
+        ]
+    }
 
-    
+    extensions = []
+
+    if profile and profile["age"]:
+        try:
+            extensions.append({
+                "url": "http://dosewise.local/fhir/StructureDefinition/age",
+                "valueInteger": int(profile["age"])
+            })
+        except ValueError:
+            pass
+
+    if profile and profile["conditions"]:
+        extensions.append({
+            "url": "http://dosewise.local/fhir/StructureDefinition/conditions",
+            "valueString": profile["conditions"]
+        })
+
+    if profile and profile["notes"]:
+        extensions.append({
+            "url": "http://dosewise.local/fhir/StructureDefinition/notes",
+            "valueString": profile["notes"]
+        })
+
+    if extensions:
+        patient["extension"] = extensions
+
+    return patient
+
+@app.route("/api/fhir/sync-patient", methods=["POST"])
+def sync_patient_to_fhir():
+    user_id = get_logged_in_user()
+
+    if not user_id:
+        return jsonify({"error": "Authentication required."}), 401
+
+    conn = get_db_connection()
+
+    user = conn.execute(
+        "SELECT id, name, email FROM users WHERE id = ?",
+        (user_id,)
+    ).fetchone()
+
+    profile = conn.execute(
+        "SELECT * FROM user_profiles WHERE user_id = ?",
+        (user_id,)
+    ).fetchone()
+
+    conn.close()
+
+    if not user:
+        return jsonify({"error": "User not found."}), 404
+
+    patient_resource = build_fhir_patient(user, profile)
+
+    try:
+        fhir_patient_id = f"dosewise-user-{user_id}"
+
+        patient_resource["id"] = fhir_patient_id
+
+        response = requests.put(
+            f"{FHIR_SERVER_URL}/Patient/{fhir_patient_id}",
+            json=patient_resource,
+            headers={
+                "Content-Type": "application/fhir+json",
+                "Accept": "application/fhir+json"
+            },
+            timeout=10
+        )
+
+        if response.status_code not in [200, 201]:
+            print("FHIR STATUS:", response.status_code)
+            print("FHIR RESPONSE:", response.text)
+            print("FHIR SENT RESOURCE:", patient_resource)
+
+            match = re.search(r"Patient/([A-Za-z0-9\-.]+)", response.text)
+
+            if response.status_code == 412 and match:
+                existing_patient_id = match.group(1)
+
+                return jsonify({
+                    "message": "Patient profile already exists on FHIR server.",
+                    "fhir_patient_id": existing_patient_id,
+                    "fhir_server_url": FHIR_SERVER_URL
+                }), 200
+
+            fhir_response = response.json()
+            patient_id = fhir_response.get("id")
+
+            return jsonify({
+                "message": "Patient profile synced to FHIR server.",
+                "fhir_patient_id": patient_id,
+                "fhir_server_url": FHIR_SERVER_URL,
+                "resource": fhir_response
+            }), 200
+
+        fhir_response = response.json()
+
+        return jsonify({
+            "message": "Patient profile synced to FHIR server.",
+            "fhir_patient_id": fhir_response.get("id"),
+            # "fhir_server_url": FHIR_SERVER_URL,
+            "resource": fhir_response
+        }), 200
+
+
+    except requests.RequestException as e:
+        print("FHIR CONNECTION ERROR:", str(e))
+        return jsonify({
+            "error": "Could not connect to FHIR server.",
+            "details": str(e)
+        }), 502
+
 @app.route("/fhir/Patient/<int:patient_id>", methods=["GET"])
 def get_fhir_patient(patient_id):
     user_id = get_logged_in_user()
@@ -764,17 +989,33 @@ def get_fhir_patient(patient_id):
         (user_id,)
     ).fetchone()
 
+    if not user:
+        conn.close()
+        return jsonify({"error": "Patient not found"}), 404
+
     profile = conn.execute(
         "SELECT name, age, allergies, conditions, notes FROM user_profiles WHERE user_id = ?",
         (user_id,)
     ).fetchone()
 
+    medications = conn.execute(
+        "SELECT * FROM medications WHERE user_id = ?",
+        (user_id,)
+    ).fetchall()
+
     conn.close()
 
-    if not user:
-        return jsonify({"error": "Patient not found"}), 404
+    fhir_patient = build_fhir_patient(dict(user), dict(profile) if profile else None)
 
-    return jsonify(build_fhir_patient(dict(user), dict(profile) if profile else {}))
+    fhir_medication_requests = [
+        build_fhir_medication_request(user_id, dict(medication))
+        for medication in medications
+    ]
+
+    return jsonify({
+        "patient": fhir_patient,
+        "medicationRequests": fhir_medication_requests
+    })
 
 @app.route("/api/allergies", methods=["GET"])
 def get_known_allergies():
@@ -864,7 +1105,7 @@ def get_medications():
 
     return jsonify({
         "medications": medications,
-        "fhirBundle": build_fhir_medication_bundle(medications)
+        "fhirBundle": build_fhir_medication_bundle(user_id, medications)
     })
 
 @app.route("/api/medications/<int:medication_id>", methods=["PATCH"])

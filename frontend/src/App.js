@@ -226,6 +226,9 @@ function App() {
   const [addingMedication, setAddingMedication] = useState(null)
   const [deletingMedication, setDeletingMedication] = useState(null)
 
+  const [fhirStatus, setFhirStatus] = useState("");
+  const [fhirPatientLink, setFhirPatientLink] = useState("");
+
   const [profile, setProfile] = useState({
     name: "",
     age: "",
@@ -539,6 +542,44 @@ function App() {
     setNewAllergyWarnings([]);
     setLastAddedMedicationId(null);
   };
+
+  async function handleSyncFHIR() {
+    setFhirStatus("");
+    setFhirPatientLink("");
+
+    try {
+      const response = await fetch(`${API_BASE}/api/fhir/sync-patient`, {
+        method: "POST",
+        headers: authHeaders({
+          "Content-Type": "application/json"
+        })
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || "FHIR sync failed.");
+      }
+
+      const patientId = data.fhir_patient_id || data.resource?.id;
+
+      if (!patientId) {
+        console.log("FHIR response missing patient ID:", data);
+        setFhirStatus("Profile synced, but no FHIR Patient ID was returned.");
+        return;
+      }
+
+      setFhirStatus(
+        `Profile synced to FHIR server. Patient resource ID: ${patientId}`
+      );
+
+      setFhirPatientLink(
+        `https://hapi.fhir.org/baseR4/Patient/${patientId}`
+      );
+    } catch (err) {
+      setFhirStatus(err.message);
+    }
+  }
 
   const handleSearch = async () => {
     if (!query.trim()) {
@@ -1587,6 +1628,31 @@ if (!loggedIn) {
                 >
                   {profileLoading ? "Saving..." : "Save Profile"}
                 </button>
+
+                <button
+                  type="button"
+                  className="btn btn-outline-primary mt-3"
+                  onClick={handleSyncFHIR}
+                >
+                  Sync Profile to FHIR Server
+                </button>
+
+                {fhirStatus && (
+                  <div className="alert alert-info mt-3">
+                    <div>{fhirStatus}</div>
+
+                    {fhirPatientLink && (
+                      <a
+                        href={fhirPatientLink}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="d-block mt-2"
+                      >
+                        View FHIR Patient Resource
+                      </a>
+                    )}
+                  </div>
+                )}
               </div>
             </>
           ) : (

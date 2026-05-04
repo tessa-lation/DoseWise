@@ -1,11 +1,7 @@
 {
-<<<<<<< HEAD
-  "short_name": "React App",
-  "name": "Create React App Sample",
-=======
   "short_name": "DoseWise",
   "name": "DoseWise",
->>>>>>> development
+
   "icons": [
     {
       "src": "favicon.ico",
@@ -25,11 +21,8 @@
   ],
   "start_url": ".",
   "display": "standalone",
-<<<<<<< HEAD
-  "theme_color": "#000000",
-  "background_color": "#ffffff"
-=======
+
   "theme_color": "#1c7a74",
   "background_color": "#fdf8f1"
->>>>>>> development
+
 }
